@@ -45,6 +45,9 @@ func AdvisoryDiscover() *cobra.Command {
 
 type discoverParams struct {
 	secfixesTrackerHostname string
+
+	nvdURL string
+	
 }
 
 func (p *discoverParams) addFlagsTo(cmd *cobra.Command) {

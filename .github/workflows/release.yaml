@@ -3,6 +3,9 @@ name: release
 on:
   schedule:
     - cron: '0 0 * * 1' # weekly on Monday at 00:00
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:

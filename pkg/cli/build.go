@@ -26,6 +26,7 @@ import (
 	"github.com/chainguard-dev/go-apk/pkg/apk"
 	charmlog "github.com/charmbracelet/log"
 	"github.com/dominikbraun/graph"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
@@ -35,6 +36,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
+	"github.com/wolfi-dev/wolfictl/pkg/internal/bundle"
 )
 
 func cmdBuild() *cobra.Command {
@@ -109,6 +111,7 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.cacheSource, "cache-source", "", "directory or bucket used for preloading the cache")
 	cmd.Flags().BoolVar(&cfg.generateIndex, "generate-index", true, "whether to generate APKINDEX.tar.gz")
 	cmd.Flags().StringVar(&cfg.dst, "destination-repository", "", "repo where packages will eventually be uploaded, used to skip existing packages (currently only supports http)")
+	cmd.Flags().StringVar(&cfg.bundle, "bundle", "", "bundle of work to do (experimental)")
 
 	cmd.Flags().IntVarP(&jobs, "jobs", "j", 0, "number of jobs to run concurrently (default is GOMAXPROCS)")
 	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
@@ -201,6 +204,133 @@ func fetchIndex(ctx context.Context, dst, arch string) (map[string]struct{}, err
 	}
 
 	return exist, nil
+}
+
+func buildBundle(ctx context.Context, cfg *global, ref string) error {
+	var eg errgroup.Group
+
+	bundle, err := bundle.Pull(ref)
+	if err != nil {
+		return err
+	}
+
+	var mu sync.Mutex
+	cfg.exists = map[string]map[string]struct{}{}
+
+	for _, arch := range cfg.archs {
+		arch := arch
+
+		eg.Go(func() error {
+			// Logs will go here to mimic the wolfi Makefile.
+			archDir := cfg.logdir(arch)
+			if err := os.MkdirAll(archDir, os.ModePerm); err != nil {
+				return fmt.Errorf("creating buildlogs directory: %w", err)
+			}
+
+			return nil
+		})
+
+		// If --destination-repository is set, we want to fetch and parse the APKINDEX concurrently with walking all the configs.
+		eg.Go(func() error {
+			exist, err := fetchIndex(ctx, cfg.dst, arch)
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			cfg.exists[types.ParseArchitecture(arch).ToAPK()] = exist
+
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	newTask := func(pkg string, ref name.Digest) *task {
+		return &task{
+			cfg:  cfg,
+			pkg:  pkg,
+			ref:  &ref,
+			cond: sync.NewCond(&sync.Mutex{}),
+			deps: map[string]*task{},
+		}
+	}
+
+	tasks := map[string]*task{}
+	for pkg, ref := range bundle.Packages {
+		tasks[pkg] = newTask(pkg, ref)
+	}
+
+	for k, v := range bundle.Graph {
+		// The package list is in the form of "pkg:version", but we only care about the package name.
+		pkg, _, ok := strings.Cut(k, ":")
+		if !ok {
+			return fmt.Errorf("unexpected key: %q", k)
+		}
+
+		for _, dep := range v {
+			d, _, ok := strings.Cut(dep.Target, ":")
+			if !ok {
+				return fmt.Errorf("unexpected dep: %q", dep)
+			}
+
+			tasks[pkg].deps[d] = tasks[d]
+		}
+	}
+
+	if len(tasks) == 0 {
+		return fmt.Errorf("no packages to build")
+	}
+
+	todos := tasks
+	for _, t := range todos {
+		t.maybeStart(ctx)
+	}
+	count := len(todos)
+
+	// We're ok with Info level from here on.
+	log := clog.FromContext(ctx)
+
+	errs := []error{}
+	skipped := 0
+
+	for len(todos) != 0 {
+		t := <-cfg.donech
+		delete(todos, t.pkg)
+
+		if err := t.err; err != nil {
+			errs = append(errs, fmt.Errorf("failed to build %s: %w", t.pkg, err))
+			log.Errorf("Failed to build %s (%d/%d)", t.pkg, len(errs), count)
+			continue
+		}
+
+		// Logging every skipped package is too noisy, so we just print a summary
+		// of the number of packages we skipped between actual builds.
+		if t.skipped {
+			skipped++
+			continue
+		} else if skipped != 0 {
+			log.Infof("Skipped building %d packages", skipped)
+			skipped = 0
+		}
+
+		log.Infof("Finished building %s (%d/%d)", t.pkg, count-(len(todos)+len(errs)), count)
+	}
+
+	if skipped != 0 {
+		log.Infof("Skipped building %d packages", skipped)
+	}
+
+	// If the context is cancelled, it's not useful to print everything, just summarize the count.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("failed to build %d packages: %w", len(errs), err)
+	}
+
+	return errors.Join(errs...)
 }
 
 func buildAll(ctx context.Context, cfg *global, args []string) error {
@@ -380,6 +510,8 @@ type global struct {
 	exists map[string]map[string]struct{}
 
 	mu sync.Mutex
+
+	bundle string
 }
 
 func (g *global) logdir(arch string) string {
@@ -400,10 +532,10 @@ type task struct {
 	done    bool
 	skipped bool
 
-	bundled v1.ImageIndex
-
 	// TODO: This is a hack, refactor the task execution out from the graph walking.
-	bcfg *bundleConfig
+	ref     *name.Digest
+	bundled v1.ImageIndex
+	bcfg    *bundleConfig
 }
 
 func (t *task) gitSDE(ctx context.Context) (string, error) {
@@ -483,6 +615,10 @@ func (t *task) pkgver() string {
 func (t *task) buildArch(ctx context.Context, arch string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	if t.ref != nil {
+		return t.buildBundleArch(ctx, arch)
 	}
 
 	log := clog.FromContext(ctx)
@@ -568,6 +704,12 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 		return fmt.Errorf("building package (see %q for logs): %w", logfile, err)
 	}
 
+	return nil
+}
+
+func (t *task) buildBundleArch(ctx context.Context, arch string) error {
+	// TODO: This is where we'd schedule the builds.
+	clog.FromContext(ctx).Errorf("This is where I would build stuff")
 	return nil
 }
 

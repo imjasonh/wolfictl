@@ -3,6 +3,7 @@ package bundle
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,11 +12,13 @@ import (
 
 	"chainguard.dev/apko/pkg/build/types"
 	"chainguard.dev/melange/pkg/config"
+	"github.com/dominikbraun/graph"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	ggcrtypes "github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
@@ -193,6 +196,79 @@ func New(config *dag.Configuration, base v1.ImageIndex, entrypoints map[types.Ar
 	return idx, nil
 }
 
+type Bundle struct {
+}
+
+// Yuck.
+type Graph = map[string]map[string]graph.Edge[string]
+
+type Bundles struct {
+	Graph    Graph
+	Packages map[string]name.Digest
+}
+
+// TODO: dependency injection
+func Pull(pull string) (*Bundles, error) {
+	ref, err := name.ParseReference(pull)
+	if err != nil {
+		return nil, err
+	}
+
+	idx, err := remote.Index(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	im, err := idx.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(im.Manifests) == 0 {
+		return nil, fmt.Errorf("no manifests in bundle index: %s", pull)
+	}
+
+	desc := im.Manifests[0]
+	img, err := idx.Image(desc.Digest)
+	if err != nil {
+		return nil, err
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("no layers in first entry %s of bundle %s", desc.Digest.String(), pull)
+	}
+
+	rc, err := layers[0].Compressed()
+	if err != nil {
+		return nil, err
+	}
+
+	var graph Graph
+	if err := json.NewDecoder(rc).Decode(&graph); err != nil {
+		return nil, err
+	}
+
+	pkgs := map[string]name.Digest{}
+
+	for i, desc := range im.Manifests[1:] {
+		pkg, ok := desc.Annotations["dev.wolfi.bundle.package"]
+		if !ok {
+			return nil, fmt.Errorf("expected package annotation in %dth descriptor", i)
+		}
+
+		pkgs[pkg] = ref.Context().Digest(desc.Digest.String())
+	}
+
+	return &Bundles{
+		Graph:    graph,
+		Packages: pkgs,
+	}, nil
+}
+
 // escapeRFC1123 escapes a string to be RFC1123 compliant.  We don't worry about
 // being collision free because these are generally fed to generateName which
 // appends a randomized suffix.
@@ -202,7 +278,7 @@ func escapeRFC1123(name string) string {
 
 // Podspec returns bytes of yaml representing a podspec.
 // This is a terrible API that we should change.
-func Podspec(cfg *dag.Configuration, ref name.Reference, arch string) *corev1.Pod {
+func Podspec(cfg *config.Configuration, ref name.Reference, arch string) *corev1.Pod {
 	goarch := types.ParseArchitecture(arch).String()
 
 	resources := cfg.Package.Resources

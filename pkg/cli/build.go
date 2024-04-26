@@ -93,6 +93,10 @@ func cmdBuild() *cobra.Command {
 				cfg.outDir = filepath.Join(cfg.dir, "packages")
 			}
 
+			if cfg.bundle != "" {
+				return buildBundles(ctx, &cfg, cfg.bundle)
+			}
+
 			return buildAll(ctx, &cfg, args)
 		},
 	}
@@ -206,10 +210,10 @@ func fetchIndex(ctx context.Context, dst, arch string) (map[string]struct{}, err
 	return exist, nil
 }
 
-func buildBundle(ctx context.Context, cfg *global, ref string) error {
+func buildBundles(ctx context.Context, cfg *global, ref string) error {
 	var eg errgroup.Group
 
-	bundle, err := bundle.Pull(ref)
+	bundles, err := bundle.Pull(ref)
 	if err != nil {
 		return err
 	}
@@ -251,21 +255,28 @@ func buildBundle(ctx context.Context, cfg *global, ref string) error {
 	}
 
 	newTask := func(pkg string, ref name.Digest) *task {
+		bundle, err := bundles.Bundle(pkg)
+		if err != nil {
+			panic(fmt.Errorf("fetching bundle %s: %w", pkg, err))
+		}
 		return &task{
-			cfg:  cfg,
-			pkg:  pkg,
-			ref:  &ref,
-			cond: sync.NewCond(&sync.Mutex{}),
-			deps: map[string]*task{},
+			cfg:   cfg,
+			pkg:   pkg,
+			ver:   bundle.Version,
+			epoch: bundle.Epoch,
+			ref:   &ref,
+			archs: bundle.Architectures,
+			cond:  sync.NewCond(&sync.Mutex{}),
+			deps:  map[string]*task{},
 		}
 	}
 
 	tasks := map[string]*task{}
-	for pkg, ref := range bundle.Packages {
+	for pkg, ref := range bundles.Packages {
 		tasks[pkg] = newTask(pkg, ref)
 	}
 
-	for k, v := range bundle.Graph {
+	for k, v := range bundles.Graph {
 		// The package list is in the form of "pkg:version", but we only care about the package name.
 		pkg, _, ok := strings.Cut(k, ":")
 		if !ok {
@@ -393,7 +404,10 @@ func buildAll(ctx context.Context, cfg *global, args []string) error {
 		return &task{
 			cfg:    cfg,
 			pkg:    pkg,
+			ver:    c.Package.Version,
+			epoch:  c.Package.Epoch,
 			config: c,
+			archs:  filterArchs(cfg.archs, c.Package.TargetArchitecture),
 			cond:   sync.NewCond(&sync.Mutex{}),
 			deps:   map[string]*task{},
 		}
@@ -522,7 +536,11 @@ type task struct {
 	cfg *global
 
 	pkg    string
+	ver    string
+	epoch  uint64
 	config *dag.Configuration
+
+	archs []string
 
 	err  error
 	deps map[string]*task
@@ -583,13 +601,16 @@ func (t *task) start(ctx context.Context) {
 	defer func() { <-t.cfg.jobch }()
 
 	// all deps are done and we're clear to launch.
-	t.err = t.build(ctx)
+	if t.ref != nil {
+		t.err = t.buildBundle(ctx)
+	} else {
+		t.err = t.build(ctx)
+	}
 }
 
 // return intersection of global archs flag and explicit target architectures
-func (t *task) filterArchs() []string {
-	cloned := slices.Clone(t.cfg.archs)
-	targets := t.config.Package.TargetArchitecture
+func filterArchs(archs []string, targets []string) []string {
+	cloned := slices.Clone(archs)
 
 	if len(targets) == 0 || targets[0] == "all" {
 		return cloned
@@ -609,16 +630,12 @@ func (t *task) filterArchs() []string {
 }
 
 func (t *task) pkgver() string {
-	return fmt.Sprintf("%s-%s-r%d", t.config.Package.Name, t.config.Package.Version, t.config.Package.Epoch)
+	return fmt.Sprintf("%s-%s-r%d", t.pkg, t.ver, t.epoch)
 }
 
 func (t *task) buildArch(ctx context.Context, arch string) error {
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-
-	if t.ref != nil {
-		return t.buildBundleArch(ctx, arch)
 	}
 
 	log := clog.FromContext(ctx)
@@ -708,20 +725,22 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 }
 
 func (t *task) buildBundleArch(ctx context.Context, arch string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// TODO: This is where we'd schedule the builds.
-	clog.FromContext(ctx).Errorf("This is where I would build stuff")
+	clog.FromContext(ctx).Infof("This is where I would build stuff")
 	return nil
 }
 
 func (t *task) build(ctx context.Context) error {
 	log := clog.FromContext(ctx)
 
-	archs := t.filterArchs()
-
 	needsBuild := map[string]bool{}
 	needsIndex := map[string]bool{}
 
-	for _, arch := range archs {
+	for _, arch := range t.archs {
 		apkFile := t.pkgver() + ".apk"
 		apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 
@@ -748,7 +767,7 @@ func (t *task) build(ctx context.Context) error {
 	}
 
 	var buildGroup errgroup.Group
-	for _, arch := range archs {
+	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
 		buildGroup.Go(func() error {
 			return t.buildArch(ctx, arch)
@@ -771,7 +790,7 @@ func (t *task) build(ctx context.Context) error {
 	defer t.cfg.mu.Unlock()
 
 	var indexGroup errgroup.Group
-	for _, arch := range archs {
+	for _, arch := range t.archs {
 		arch := types.ParseArchitecture(arch).ToAPK()
 		indexGroup.Go(func() error {
 			packageDir := filepath.Join(t.cfg.outDir, arch)
@@ -822,6 +841,118 @@ func (t *task) build(ctx context.Context) error {
 	}
 
 	// TODO: This is where we would update the index.
+
+	return nil
+}
+
+func (t *task) buildBundle(ctx context.Context) error {
+	log := clog.FromContext(ctx)
+
+	needsBuild := map[string]bool{}
+	needsIndex := map[string]bool{}
+
+	for _, arch := range t.archs {
+		apkFile := t.pkgver() + ".apk"
+		apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
+
+		// See if we already have the package indexed.
+		if _, ok := t.cfg.exists[arch][apkFile]; ok {
+			log.Debugf("Skipping %s, already indexed", apkFile)
+			continue
+		}
+
+		needsIndex[arch] = true
+
+		// See if we already have the package built.
+		if _, err := os.Stat(apkPath); err == nil {
+			log.Debugf("Skipping %s, already built", apkPath)
+			continue
+		}
+
+		needsBuild[arch] = true
+	}
+
+	if len(needsBuild) == 0 && len(needsIndex) == 0 {
+		t.skipped = true
+		return nil
+	}
+
+	var buildGroup errgroup.Group
+	for _, arch := range t.archs {
+		arch := types.ParseArchitecture(arch).ToAPK()
+		buildGroup.Go(func() error {
+			return t.buildBundleArch(ctx, arch)
+		})
+	}
+
+	if err := buildGroup.Wait(); err != nil {
+		return err
+	}
+
+	if t.cfg.dryrun {
+		return nil
+	}
+
+	if !t.cfg.generateIndex {
+		return nil
+	}
+
+	t.cfg.mu.Lock()
+	defer t.cfg.mu.Unlock()
+
+	var indexGroup errgroup.Group
+	for _, arch := range t.archs {
+		arch := types.ParseArchitecture(arch).ToAPK()
+		indexGroup.Go(func() error {
+			log.Infof("this is where we'd fetch from the bucket for %s", t.pkg)
+			packageDir := filepath.Join(t.cfg.outDir, arch)
+			log.Infof("Generating apk index from packages in %s", packageDir)
+
+			// cfg := t.config.Configuration
+			// apkFile := t.pkgver() + ".apk"
+			// apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
+
+			// var apkFiles []string
+			// apkFiles = append(apkFiles, apkPath)
+
+			// for i := range cfg.Subpackages {
+			// 	// gocritic complains about copying if you do the normal thing because Subpackages is not a slice of pointers.
+			// 	subName := cfg.Subpackages[i].Name
+
+			// 	subpkgApk := fmt.Sprintf("%s-%s-r%d.apk", subName, cfg.Package.Version, cfg.Package.Epoch)
+			// 	subpkgFileName := filepath.Join(packageDir, subpkgApk)
+			// 	if _, err := os.Stat(subpkgFileName); err != nil {
+			// 		log.Warnf("Skipping subpackage %s (was not built): %v", subpkgFileName, err)
+			// 		continue
+			// 	}
+			// 	apkFiles = append(apkFiles, subpkgFileName)
+			// }
+
+			// opts := []index.Option{
+			// 	index.WithPackageFiles(apkFiles),
+			// 	index.WithSigningKey(t.cfg.signingKey),
+			// 	index.WithMergeIndexFileFlag(true),
+			// 	index.WithIndexFile(filepath.Join(packageDir, "APKINDEX.tar.gz")),
+			// }
+
+			// idx, err := index.New(opts...)
+			// if err != nil {
+			// 	return fmt.Errorf("unable to create index: %w", err)
+			// }
+
+			// if err := idx.GenerateIndex(ctx); err != nil {
+			// 	return fmt.Errorf("unable to generate index: %w", err)
+			// }
+
+			return nil
+		})
+	}
+
+	if err := indexGroup.Wait(); err != nil {
+		return err
+	}
+
+	log.Infof("// TODO: This is where we would update the index.")
 
 	return nil
 }

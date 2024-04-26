@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -197,14 +198,73 @@ func New(config *dag.Configuration, base v1.ImageIndex, entrypoints map[types.Ar
 }
 
 type Bundle struct {
+	idx           v1.ImageIndex
+	Package       string
+	Version       string
+	Epoch         uint64
+	Architectures []string
 }
 
 // Yuck.
 type Graph = map[string]map[string]graph.Edge[string]
 
 type Bundles struct {
+	idx      v1.ImageIndex
 	Graph    Graph
 	Packages map[string]name.Digest
+}
+
+func (b *Bundles) Bundle(want string) (*Bundle, error) {
+	im, err := b.idx.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	for i, desc := range im.Manifests[1:] {
+		pkg, ok := desc.Annotations["dev.wolfi.bundle.package"]
+		if !ok {
+			return nil, fmt.Errorf("expected package annotation in %dth descriptor", i)
+		}
+		version, ok := desc.Annotations["dev.wolfi.bundle.version"]
+		if !ok {
+			return nil, fmt.Errorf("expected package annotation in %dth descriptor", i)
+		}
+		sepoch, ok := desc.Annotations["dev.wolfi.bundle.epoch"]
+		if !ok {
+			return nil, fmt.Errorf("expected package annotation in %dth descriptor", i)
+		}
+		epoch, err := strconv.ParseUint(sepoch, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing epoch: %w", err)
+		}
+
+		if pkg == want {
+			child, err := b.idx.ImageIndex(desc.Digest)
+			if err != nil {
+				return nil, err
+			}
+
+			cm, err := child.IndexManifest()
+			if err != nil {
+				return nil, err
+			}
+
+			archs := []string{}
+			for _, desc := range cm.Manifests {
+				archs = append(archs, desc.Platform.Architecture)
+			}
+
+			return &Bundle{
+				idx:           child,
+				Package:       want,
+				Version:       version,
+				Epoch:         epoch,
+				Architectures: archs,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not find package %q", want)
 }
 
 // TODO: dependency injection
@@ -264,6 +324,7 @@ func Pull(pull string) (*Bundles, error) {
 	}
 
 	return &Bundles{
+		idx:      idx,
 		Graph:    graph,
 		Packages: pkgs,
 	}, nil

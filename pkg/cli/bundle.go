@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing/fstest"
@@ -169,7 +170,10 @@ func bundleAll(ctx context.Context, cfg *global, bcfg *bundleConfig, args []stri
 			cfg:    cfg,
 			bcfg:   bcfg,
 			pkg:    pkg,
+			ver:    c.Package.Version,
+			epoch:  c.Package.Epoch,
 			config: c,
+			archs:  filterArchs(cfg.archs, c.Package.TargetArchitecture),
 			cond:   sync.NewCond(&sync.Mutex{}),
 			deps:   map[string]*task{},
 		}
@@ -281,6 +285,8 @@ func bundleAll(ctx context.Context, cfg *global, bcfg *bundleConfig, args []stri
 			Descriptor: v1.Descriptor{
 				Annotations: map[string]string{
 					"dev.wolfi.bundle.package": pkg,
+					"dev.wolfi.bundle.version": t.config.Package.Version,
+					"dev.wolfi.bundle.epoch":   strconv.FormatUint(t.config.Package.Epoch, 10),
 				},
 			},
 		})
@@ -330,12 +336,10 @@ func (t *task) bundle(ctx context.Context) error {
 		}
 	}
 
-	archs := t.filterArchs()
-
 	needsBuild := map[string]bool{}
 	needsIndex := map[string]bool{}
 
-	for _, arch := range archs {
+	for _, arch := range t.archs {
 		apkFile := t.pkgver() + ".apk"
 		apkPath := filepath.Join(t.cfg.outDir, arch, apkFile)
 
@@ -369,7 +373,7 @@ func (t *task) bundle(ctx context.Context) error {
 	if t.bcfg.repo != "" {
 		entrypoints := map[types.Architecture]*bundle.Entrypoint{}
 
-		for _, arch := range archs {
+		for _, arch := range t.archs {
 			flags := []string{
 				"--arch=" + arch,
 				"--envfile=" + envFile(arch),

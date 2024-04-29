@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -22,6 +25,7 @@ import (
 	"chainguard.dev/melange/pkg/container"
 	"chainguard.dev/melange/pkg/container/docker"
 	"chainguard.dev/melange/pkg/index"
+	"cloud.google.com/go/storage"
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/go-apk/pkg/apk"
 	charmlog "github.com/charmbracelet/log"
@@ -34,6 +38,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/cli-runtime/pkg/printers"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
 	"github.com/wolfi-dev/wolfictl/pkg/internal/bundle"
@@ -94,6 +100,15 @@ func cmdBuild() *cobra.Command {
 			}
 
 			if cfg.bundle != "" {
+				if cfg.bucket == "" {
+					return fmt.Errorf("need --bucket with --bundle")
+				}
+
+				client, err := storage.NewClient(ctx)
+				if err != nil {
+					return fmt.Errorf("creating gcs client: %w", err)
+				}
+				cfg.gcs = client
 				return buildBundles(ctx, &cfg, cfg.bundle)
 			}
 
@@ -116,6 +131,7 @@ func cmdBuild() *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.generateIndex, "generate-index", true, "whether to generate APKINDEX.tar.gz")
 	cmd.Flags().StringVar(&cfg.dst, "destination-repository", "", "repo where packages will eventually be uploaded, used to skip existing packages (currently only supports http)")
 	cmd.Flags().StringVar(&cfg.bundle, "bundle", "", "bundle of work to do (experimental)")
+	cmd.Flags().StringVar(&cfg.bucket, "bucket", "", "gcs bucket to upload results (experimental)")
 
 	cmd.Flags().IntVarP(&jobs, "jobs", "j", 0, "number of jobs to run concurrently (default is GOMAXPROCS)")
 	cmd.Flags().StringVar(&traceFile, "trace", "", "where to write trace output")
@@ -218,6 +234,13 @@ func buildBundles(ctx context.Context, cfg *global, ref string) error {
 		return err
 	}
 
+	var stuff *configStuff
+	eg.Go(func() error {
+		var err error
+		stuff, err = walkConfigs(ctx, cfg)
+		return err
+	})
+
 	var mu sync.Mutex
 	cfg.exists = map[string]map[string]struct{}{}
 
@@ -255,19 +278,30 @@ func buildBundles(ctx context.Context, cfg *global, ref string) error {
 	}
 
 	newTask := func(pkg string, ref name.Digest) *task {
+		// TODO: We shouldn't need this since it would be included in the bundle.
+		loadedCfg := stuff.pkgs.Config(pkg, true)
+		if len(loadedCfg) == 0 {
+			panic(fmt.Sprintf("package does not seem to exist: %s", pkg))
+		}
+		c := loadedCfg[0]
+		if pkg != c.Package.Name {
+			panic(fmt.Sprintf("mismatched package, got %q, want %q", c.Package.Name, pkg))
+		}
+
 		bundle, err := bundles.Bundle(pkg)
 		if err != nil {
 			panic(fmt.Errorf("fetching bundle %s: %w", pkg, err))
 		}
 		return &task{
-			cfg:   cfg,
-			pkg:   pkg,
-			ver:   bundle.Version,
-			epoch: bundle.Epoch,
-			ref:   &ref,
-			archs: bundle.Architectures,
-			cond:  sync.NewCond(&sync.Mutex{}),
-			deps:  map[string]*task{},
+			cfg:    cfg,
+			pkg:    pkg,
+			ver:    bundle.Version,
+			epoch:  bundle.Epoch,
+			config: c,
+			ref:    &ref,
+			archs:  bundle.Architectures,
+			cond:   sync.NewCond(&sync.Mutex{}),
+			deps:   map[string]*task{},
 		}
 	}
 
@@ -526,6 +560,8 @@ type global struct {
 	mu sync.Mutex
 
 	bundle string
+	gcs    *storage.Client
+	bucket string
 }
 
 func (g *global) logdir(arch string) string {
@@ -724,6 +760,17 @@ func (t *task) buildArch(ctx context.Context, arch string) error {
 	return nil
 }
 
+func (t *task) signedUrl(ctx context.Context, object string) (string, error) {
+	bucket := t.cfg.gcs.Bucket(t.cfg.bucket)
+	opts := &storage.SignedURLOptions{
+		Method:      "PUT",
+		Expires:     time.Now().Add(12 * time.Hour),
+		ContentType: "application/octet-stream",
+		// TODO: Add contentType
+	}
+	return bucket.SignedURL(object, opts)
+}
+
 func (t *task) buildBundleArch(ctx context.Context, arch string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -731,7 +778,71 @@ func (t *task) buildBundleArch(ctx context.Context, arch string) error {
 
 	// TODO: This is where we'd schedule the builds.
 	clog.FromContext(ctx).Infof("This is where I would build stuff")
+	// TODO: Add the signed URL.
+	pod := bundle.Podspec(t.config.Configuration, t.ref, arch)
+
+	object := fmt.Sprintf("%s/%s-%s-r%d.tar.gz", arch, t.pkg, t.ver, t.epoch)
+
+	u, err := t.signedUrl(ctx, object)
+	if err != nil {
+		return err
+	}
+
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+		Name:  "PACKAGES_UPLOAD_URL",
+		Value: u,
+	})
+
+	var buf bytes.Buffer
+	if err := (&printers.YAMLPrinter{}).PrintObj(pod, &buf); err != nil {
+		return err
+	}
+
+	b := buf.Bytes()
+
+	if _, err := io.Copy(os.Stderr, bytes.NewReader(b)); err != nil {
+		return err
+	}
+
+	// TODO: Better :(
+	if err := kubectl(ctx, bytes.NewReader(b), "create", "-f", "-"); err != nil {
+		return fmt.Errorf("kubectl create: %w", err)
+	}
+
+	if err := kubectl(ctx, bytes.NewReader(b), "wait", "--for=condition=Completed", "pod/"+pod.ObjectMeta.Name); err != nil {
+		return fmt.Errorf("kubectl wait: %w", err)
+	}
+
+	tmp, err := os.CreateTemp("", "")
+	if err != nil {
+		return err
+	}
+	defer tmp.Close()
+
+	rc, err := t.cfg.gcs.Bucket(t.cfg.bucket).Object(object).NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	zr, err := gzip.NewReader(bufio.NewReaderSize(rc, 1<<20))
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(tmp, zr); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func kubectl(ctx context.Context, pod io.Reader, args ...string) error {
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Stdin = pod
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	return cmd.Run()
 }
 
 func (t *task) build(ctx context.Context) error {

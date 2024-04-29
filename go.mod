@@ -1,6 +1,6 @@
 module github.com/wolfi-dev/wolfictl
 
-go 1.21.8
+go 1.22.0
 
 require (
 	chainguard.dev/apko v0.14.1-0.20240308000904-c510767a86aa
@@ -61,8 +61,8 @@ require (
 	golang.org/x/time v0.5.0
 	golang.org/x/vuln v1.0.4
 	gopkg.in/yaml.v3 v3.0.1
-	k8s.io/api v0.29.1
-	k8s.io/apimachinery v0.29.3
+	k8s.io/api v0.30.0
+	k8s.io/apimachinery v0.30.0
 	knative.dev/pkg v0.0.0-20230821102121-81e4ee140363
 	sigs.k8s.io/release-utils v0.8.1
 )
@@ -202,6 +202,7 @@ require (
 	github.com/knqyf263/go-deb-version v0.0.0-20190517075300-09fca494f03d // indirect
 	github.com/knqyf263/go-rpmdb v0.1.0 // indirect
 	github.com/letsencrypt/boulder v0.0.0-20240307221842-74328338a0f6 // indirect
+	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de // indirect
 	github.com/magiconair/properties v1.8.7 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/masahiro331/go-mvn-version v0.0.0-20210429150710-d3157d602a08 // indirect
@@ -312,6 +313,8 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gorm.io/gorm v1.25.9 // indirect
+	k8s.io/cli-runtime v0.30.0 // indirect
+	k8s.io/client-go v0.30.0 // indirect
 	k8s.io/klog/v2 v2.120.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20240228011516-70dd3763d340 // indirect
 	k8s.io/utils v0.0.0-20230726121419-3b25d923346b // indirect
@@ -321,6 +324,7 @@ require (
 	modernc.org/sqlite v1.29.5 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
+	sigs.k8s.io/yaml v1.4.0 // indirect
 )
 
 replace golang.org/x/vuln => github.com/luhring/golang-vuln v1.0.2-0.20231029212121-c364fd4725dc

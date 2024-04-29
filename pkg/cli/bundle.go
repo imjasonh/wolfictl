@@ -54,7 +54,7 @@ func cmdBundle() *cobra.Command {
 			}
 
 			if bcfg.baseRef != "" {
-				ref, err := name.ParseReference(bcfg.baseRef)
+				ref, err := name.ParseReference(bcfg.baseRef, name.Insecure)
 				if err != nil {
 					return err
 				}
@@ -293,13 +293,13 @@ func bundleAll(ctx context.Context, cfg *global, bcfg *bundleConfig, args []stri
 	}
 
 	idx := mutate.AppendManifests(empty.Index, addendums...)
-	dst, err := name.ParseReference(fmt.Sprintf("%s/%s", bcfg.repo, "index"))
+	dst, err := name.ParseReference(fmt.Sprintf("%s/%s", bcfg.repo, "index"), name.Insecure)
 	if err != nil {
 		return err
 	}
 
 	if err := bcfg.pusher.Push(ctx, dst, idx); err != nil {
-		return err
+		return fmt.Errorf("pushing %s: %w", dst, err)
 	}
 
 	digest, err := idx.Digest()
@@ -376,7 +376,7 @@ func (t *task) bundle(ctx context.Context) error {
 		for _, arch := range t.archs {
 			flags := []string{
 				"--arch=" + arch,
-				"--envfile=" + envFile(arch),
+				"--env-file=" + envFile(arch),
 				"--runner=" + t.cfg.runner,
 				"--namespace=" + t.cfg.namespace,
 				"--source-dir=" + sdir,
@@ -409,7 +409,7 @@ func (t *task) bundle(ctx context.Context) error {
 
 		t.bundled = bundled
 
-		dst, err := name.ParseReference(fmt.Sprintf("%s/%s", t.bcfg.repo, t.pkgver()))
+		dst, err := name.ParseReference(fmt.Sprintf("%s/%s", t.bcfg.repo, t.pkgver()), name.Insecure)
 		if err != nil {
 			return err
 		}

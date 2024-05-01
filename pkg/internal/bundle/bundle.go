@@ -373,8 +373,8 @@ func Podspec(cfg *config.Configuration, ref name.Reference, arch string) *corev1
 			APIVersion: "v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("melange-builder-%s-%s", escapeRFC1123(cfg.Package.Name), goarch),
-			Namespace: "default",
+			GenerateName: fmt.Sprintf("melange-builder-%s-%s-", escapeRFC1123(cfg.Package.Name), goarch),
+			Namespace:    "default",
 			Labels: map[string]string{
 				"kubernetes.io/arch":             goarch,
 				"app.kubernetes.io/component":    cfg.Package.Name,

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -39,7 +38,11 @@ import (
 	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/cli-runtime/pkg/printers"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/wolfi-dev/wolfictl/pkg/dag"
 	"github.com/wolfi-dev/wolfictl/pkg/internal/bundle"
@@ -793,24 +796,36 @@ func (t *task) buildBundleArch(ctx context.Context, arch string) error {
 		Value: u,
 	})
 
-	var buf bytes.Buffer
-	if err := (&printers.YAMLPrinter{}).PrintObj(pod, &buf); err != nil {
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
 		return err
 	}
 
-	b := buf.Bytes()
-
-	if _, err := io.Copy(os.Stderr, bytes.NewReader(b)); err != nil {
-		return err
+	pod, err = clientset.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("creating pod: %w", err)
 	}
 
-	// TODO: Better :(
-	if err := kubectl(ctx, bytes.NewReader(b), "create", "-f", "-"); err != nil {
-		return fmt.Errorf("kubectl create: %w", err)
-	}
-
-	if err := kubectl(ctx, bytes.NewReader(b), "wait", "--for=condition=Completed", "pod/"+pod.ObjectMeta.Name); err != nil {
-		return fmt.Errorf("kubectl wait: %w", err)
+	dctx, cancel := context.WithDeadline(ctx, time.Now().Add(6*time.Hour))
+	defer cancel()
+	if err := wait.PollUntilContextCancel(dctx, 6*time.Hour, true, wait.ConditionWithContextFunc(func(ctx context.Context) (bool, error) {
+		pod, err = clientset.CoreV1().Pods("default").Get(ctx, pod.ObjectMeta.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded:
+			return true, nil
+		case corev1.PodFailed:
+			return false, fmt.Errorf("pod failed")
+		}
+		return false, nil
+	})); err != nil {
+		return fmt.Errorf("waiting for pod: %w", err)
 	}
 
 	tmp, err := os.CreateTemp("", "")
@@ -825,24 +840,18 @@ func (t *task) buildBundleArch(ctx context.Context, arch string) error {
 	}
 	defer rc.Close()
 
+	// TODO: verify SHA and size
+
 	zr, err := gzip.NewReader(bufio.NewReaderSize(rc, 1<<20))
 	if err != nil {
 		return err
 	}
 
-	if _, err := io.Copy(tmp, zr); err != nil {
+	if _, err := io.Copy(tmp, zr); err != nil { //nolint:gosec
 		return err
 	}
 
 	return nil
-}
-
-func kubectl(ctx context.Context, pod io.Reader, args ...string) error {
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	cmd.Stdin = pod
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-	return cmd.Run()
 }
 
 func (t *task) build(ctx context.Context) error {

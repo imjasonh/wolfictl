@@ -38,10 +38,8 @@ func New() *cobra.Command {
 
 	cmd.AddCommand(
 		cmdAdvisory(),
-		cmdApk(),
 		cmdBuild(),
 		cmdBump(),
-		cmdCheck(),
 		cmdGh(),
 		cmdImage(),
 		cmdLint(),
